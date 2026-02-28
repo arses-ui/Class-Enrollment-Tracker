@@ -2,16 +2,20 @@
 """
 Dartmouth Course Seat Monitor
 Watches COSC 031 (Algorithms) CRN 31322 for an open seat.
-Sends a macOS notification + phone push (via ntfy.sh) when enrollment drops below the limit.
+Sends a macOS notification + email when enrollment drops below the limit.
 """
 
 import requests
 from bs4 import BeautifulSoup
 import subprocess
+import smtplib
+from email.mime.text import MIMEText
 import time
+import threading
 import logging
 import sys
 from datetime import datetime
+from config import EMAIL_ADDRESS, EMAIL_APP_PASSWORD, FRIEND_EMAILS
 
 # ── Configuration ────────────────────────────────────────────────────────────
 TARGET_CRN = "31322"
@@ -21,9 +25,8 @@ DEPT = "COSC"
 
 CHECK_INTERVAL_SECONDS = 5 * 60  # 5 minutes
 MAX_BACKOFF_SECONDS = 30 * 60    # 30 minutes max on repeated failures
+FRIEND_DELAY_SECONDS = 2 * 60    # 2 minutes delay before notifying friends
 
-# ntfy.sh push notifications — change this to your own unique topic name
-NTFY_TOPIC = "dartmouth-cosc031-CHANGEME"  # <── CHANGE THIS to match what you subscribed to in the app
 
 TIMETABLE_URL = "https://oracle-www.dartmouth.edu/dart/groucho/timetable.display_courses"
 
@@ -71,24 +74,41 @@ logging.basicConfig(
 log = logging.getLogger(__name__)
 
 
+def send_email(title: str, message: str, recipients: list[str] | None = None):
+    """Send an email notification via Gmail SMTP."""
+    if recipients is None:
+        recipients = [EMAIL_ADDRESS]
+    try:
+        msg = MIMEText(f"{message}\n\nGo enroll now!\nhttps://oracle-www.dartmouth.edu/dart/groucho/timetable.main")
+        msg["Subject"] = title
+        msg["From"] = EMAIL_ADDRESS
+        msg["To"] = ", ".join(recipients)
+
+        with smtplib.SMTP_SSL("smtp.gmail.com", 465) as server:
+            server.login(EMAIL_ADDRESS, EMAIL_APP_PASSWORD)
+            server.send_message(msg)
+        log.info("Email notification sent to %s", ", ".join(recipients))
+    except Exception as e:
+        log.warning("Failed to send email to %s: %s", ", ".join(recipients), e)
+
+
+def send_delayed_friend_emails(title: str, message: str):
+    """Wait a few minutes then email friends."""
+    time.sleep(FRIEND_DELAY_SECONDS)
+    send_email(title, message, FRIEND_EMAILS)
+
+
 def notify(title: str, message: str):
-    """Send a macOS desktop notification + phone push via ntfy.sh."""
+    """Send a macOS desktop notification + email."""
     # macOS notification
     subprocess.run([
         "osascript", "-e",
         f'display notification "{message}" with title "{title}" sound name "Glass"'
     ])
-    # Phone push via ntfy.sh
-    try:
-        requests.post(
-            f"https://ntfy.sh/{NTFY_TOPIC}",
-            headers={"Title": title, "Priority": "urgent", "Tags": "rotating_light"},
-            data=message,
-            timeout=10,
-        )
-        log.info("Phone notification sent via ntfy.sh")
-    except requests.RequestException as e:
-        log.warning("Failed to send phone notification: %s", e)
+    # Email notification (you first)
+    send_email(title, message)
+    # Email friends after a delay (runs in background so it doesn't block)
+    threading.Thread(target=send_delayed_friend_emails, args=(title, message), daemon=True).start()
 
 
 def fetch_enrollment() -> tuple[int, int] | None:
